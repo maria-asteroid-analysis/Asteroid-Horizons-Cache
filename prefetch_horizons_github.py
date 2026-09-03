@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 import time
@@ -13,6 +14,9 @@ from astropy.time import Time
 from astroquery.jplhorizons import Horizons
 
 MJDREF = 2400000.5
+
+# Keep each Horizons request below the ~90,024 row server limit.
+MAX_ROWS_PER_QUERY = 80000
 
 
 def safe_slug(value: str) -> str:
@@ -140,6 +144,172 @@ def cache_is_valid(path: Path) -> bool:
     return len(df) >= 2 and required.issubset(df.columns)
 
 
+def estimate_rows(
+    start_mjd: float,
+    stop_mjd: float,
+    step_minutes: int,
+) -> int:
+    span_minutes = max(0.0, (stop_mjd - start_mjd) * 1440.0)
+    return int(math.floor(span_minutes / step_minutes)) + 1
+
+
+def make_chunks(
+    start_mjd: float,
+    stop_mjd: float,
+    step_minutes: int,
+    max_rows: int = MAX_ROWS_PER_QUERY,
+) -> list[tuple[float, float]]:
+    """
+    Split a long query into smaller Horizons requests.
+
+    Adjacent chunks overlap at one endpoint. Duplicates are removed after
+    concatenation, preventing gaps between chunks.
+    """
+    estimated = estimate_rows(start_mjd, stop_mjd, step_minutes)
+
+    if estimated <= max_rows:
+        return [(start_mjd, stop_mjd)]
+
+    max_span_days = ((max_rows - 1) * step_minutes) / 1440.0
+
+    chunks = []
+    current = start_mjd
+
+    while current < stop_mjd:
+        end = min(current + max_span_days, stop_mjd)
+        chunks.append((current, end))
+
+        if end >= stop_mjd:
+            break
+
+        current = end
+
+    return chunks
+
+
+def horizons_table_to_dataframe(table) -> pd.DataFrame:
+    eph = table.to_pandas()
+
+    out = pd.DataFrame(
+        {
+            "jd": pd.to_numeric(
+                eph.get("datetime_jd", np.nan),
+                errors="coerce",
+            ),
+            "pred_V": pd.to_numeric(
+                eph.get("V", np.nan),
+                errors="coerce",
+            ),
+            "r_au": pd.to_numeric(
+                eph.get("r", np.nan),
+                errors="coerce",
+            ),
+            "delta_au": pd.to_numeric(
+                eph.get("delta", np.nan),
+                errors="coerce",
+            ),
+            "alpha_deg": pd.to_numeric(
+                eph.get("alpha", np.nan),
+                errors="coerce",
+            ),
+            "RA_deg": pd.to_numeric(
+                eph.get("RA", np.nan),
+                errors="coerce",
+            ),
+            "DEC_deg": pd.to_numeric(
+                eph.get("DEC", np.nan),
+                errors="coerce",
+            ),
+        }
+    )
+
+    out = out.dropna(subset=["jd"]).copy()
+    out["mjd"] = out["jd"] - MJDREF
+
+    return out
+
+
+def query_one_chunk(
+    target_id: str,
+    location: str,
+    start_mjd: float,
+    stop_mjd: float,
+    step_minutes: int,
+    retries: int,
+    sleep_seconds: float,
+    chunk_number: int,
+    chunk_count: int,
+) -> pd.DataFrame:
+    epochs = {
+        "start": mjd_to_iso_utc(start_mjd),
+        "stop": mjd_to_iso_utc(stop_mjd),
+        "step": f"{step_minutes}m",
+    }
+
+    last_exc = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            print(
+                f"[QUERY] {target_id} | "
+                f"step={step_minutes}m | "
+                f"chunk={chunk_number}/{chunk_count} | "
+                f"rows~{estimate_rows(start_mjd, stop_mjd, step_minutes)} | "
+                f"attempt={attempt}/{retries}",
+                flush=True,
+            )
+
+            table = Horizons(
+                id=target_id,
+                location=location,
+                epochs=epochs,
+            ).ephemerides()
+
+            out = horizons_table_to_dataframe(table)
+
+            if len(out) < 2:
+                raise RuntimeError(
+                    f"Horizons returned only {len(out)} usable rows "
+                    f"for {target_id}, "
+                    f"chunk {chunk_number}/{chunk_count}"
+                )
+
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+
+            return out
+
+        except Exception as exc:
+            last_exc = exc
+
+            print(
+                f"[ERROR] {target_id} "
+                f"step={step_minutes}m "
+                f"chunk={chunk_number}/{chunk_count} "
+                f"attempt={attempt}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+            if attempt < retries:
+                wait = max(
+                    sleep_seconds * (2 ** (attempt - 1)),
+                    2.0,
+                )
+                print(
+                    f"[WAIT] retrying in {wait:.1f}s",
+                    flush=True,
+                )
+                time.sleep(wait)
+
+    raise RuntimeError(
+        f"Failed Horizons query for {target_id}, "
+        f"step={step_minutes}m, "
+        f"chunk={chunk_number}/{chunk_count} "
+        f"after {retries} attempts: {last_exc}"
+    )
+
+
 def query_and_save(
     target_id: str,
     csv_path: Path,
@@ -168,107 +338,86 @@ def query_and_save(
 
     if cache_is_valid(out_path):
         print(
-            f"[SKIP cached] {target_id} step={step_minutes}m -> {out_path.name}",
+            f"[SKIP cached] {target_id} "
+            f"step={step_minutes}m -> {out_path.name}",
             flush=True,
         )
         return out_path
 
-    epochs = {
-        "start": mjd_to_iso_utc(start_mjd),
-        "stop": mjd_to_iso_utc(stop_mjd),
-        "step": f"{step_minutes}m",
-    }
-
-    last_exc = None
-
-    for attempt in range(1, retries + 1):
-        try:
-            print(
-                f"[QUERY] {target_id} | {csv_path} | "
-                f"step={step_minutes}m | attempt={attempt}/{retries}",
-                flush=True,
-            )
-
-            table = Horizons(
-                id=target_id,
-                location=location,
-                epochs=epochs,
-            ).ephemerides()
-
-            eph = table.to_pandas()
-
-            out = pd.DataFrame(
-                {
-                    "jd": pd.to_numeric(
-                        eph.get("datetime_jd", np.nan), errors="coerce"
-                    ),
-                    "pred_V": pd.to_numeric(
-                        eph.get("V", np.nan), errors="coerce"
-                    ),
-                    "r_au": pd.to_numeric(
-                        eph.get("r", np.nan), errors="coerce"
-                    ),
-                    "delta_au": pd.to_numeric(
-                        eph.get("delta", np.nan), errors="coerce"
-                    ),
-                    "alpha_deg": pd.to_numeric(
-                        eph.get("alpha", np.nan), errors="coerce"
-                    ),
-                    "RA_deg": pd.to_numeric(
-                        eph.get("RA", np.nan), errors="coerce"
-                    ),
-                    "DEC_deg": pd.to_numeric(
-                        eph.get("DEC", np.nan), errors="coerce"
-                    ),
-                }
-            )
-
-            out = out.dropna(subset=["jd"]).copy()
-            out["mjd"] = out["jd"] - MJDREF
-            out = out.sort_values("mjd").reset_index(drop=True)
-
-            if len(out) < 2:
-                raise RuntimeError(
-                    f"Horizons returned only {len(out)} usable rows "
-                    f"for {target_id}"
-                )
-
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-            tmp_path = out_path.with_suffix(".tmp.csv")
-            out.to_csv(tmp_path, index=False)
-            tmp_path.replace(out_path)
-
-            print(
-                f"[OK] {target_id} step={step_minutes}m "
-                f"rows={len(out)} -> {out_path.name}",
-                flush=True,
-            )
-
-            if sleep_seconds > 0:
-                time.sleep(sleep_seconds)
-
-            return out_path
-
-        except Exception as exc:
-            last_exc = exc
-
-            print(
-                f"[ERROR] {target_id} step={step_minutes}m "
-                f"attempt={attempt}: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-
-            if attempt < retries:
-                wait = max(sleep_seconds * (2 ** (attempt - 1)), 2.0)
-                print(f"[WAIT] retrying in {wait:.1f}s", flush=True)
-                time.sleep(wait)
-
-    raise RuntimeError(
-        f"Failed Horizons query for {target_id}, "
-        f"step={step_minutes}m after {retries} attempts: {last_exc}"
+    chunks = make_chunks(
+        start_mjd,
+        stop_mjd,
+        step_minutes,
     )
+
+    total_estimated = estimate_rows(
+        start_mjd,
+        stop_mjd,
+        step_minutes,
+    )
+
+    if len(chunks) > 1:
+        print(
+            f"[CHUNK] {target_id} "
+            f"step={step_minutes}m "
+            f"would produce ~{total_estimated} rows; "
+            f"splitting into {len(chunks)} JPL requests",
+            flush=True,
+        )
+
+    frames = []
+
+    for i, (chunk_start, chunk_stop) in enumerate(
+        chunks,
+        start=1,
+    ):
+        frame = query_one_chunk(
+            target_id=target_id,
+            location=location,
+            start_mjd=chunk_start,
+            stop_mjd=chunk_stop,
+            step_minutes=step_minutes,
+            retries=retries,
+            sleep_seconds=sleep_seconds,
+            chunk_number=i,
+            chunk_count=len(chunks),
+        )
+
+        frames.append(frame)
+
+    out = pd.concat(frames, ignore_index=True)
+
+    out = (
+        out.drop_duplicates(subset=["jd"])
+        .sort_values("mjd")
+        .reset_index(drop=True)
+    )
+
+    if len(out) < 2:
+        raise RuntimeError(
+            f"Only {len(out)} usable rows remained "
+            f"after merging for {target_id}"
+        )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    tmp_path = out_path.with_suffix(".tmp.csv")
+    out.to_csv(tmp_path, index=False)
+    tmp_path.replace(out_path)
+
+    print(
+        f"[OK] {target_id} "
+        f"step={step_minutes}m "
+        f"rows={len(out)} "
+        f"chunks={len(chunks)} -> "
+        f"{out_path.name}",
+        flush=True,
+    )
+
+    return out_path
 
 
 def main() -> int:
@@ -279,78 +428,151 @@ def main() -> int:
         type=Path,
         default=Path("choose_horizons.txt"),
     )
+
     parser.add_argument(
         "--input-dir",
         type=Path,
         default=Path("parquet"),
     )
+
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("HORIZONS_CACHE"),
     )
-    parser.add_argument("--location", default="X05")
-    parser.add_argument("--step-minutes", type=int, nargs="+", default=[1, 10])
-    parser.add_argument("--pad-minutes", type=int, default=10)
-    parser.add_argument("--batch-index", type=int, required=True)
-    parser.add_argument("--num-batches", type=int, required=True)
-    parser.add_argument("--retries", type=int, default=4)
-    parser.add_argument("--sleep-seconds", type=float, default=1.5)
+
+    parser.add_argument(
+        "--location",
+        default="X05",
+    )
+
+    parser.add_argument(
+        "--step-minutes",
+        type=int,
+        nargs="+",
+        default=[1, 10],
+    )
+
+    parser.add_argument(
+        "--pad-minutes",
+        type=int,
+        default=10,
+    )
+
+    parser.add_argument(
+        "--batch-index",
+        type=int,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--num-batches",
+        type=int,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=4,
+    )
+
+    parser.add_argument(
+        "--sleep-seconds",
+        type=float,
+        default=1.5,
+    )
 
     args = parser.parse_args()
 
     if args.num_batches < 1:
-        raise SystemExit("--num-batches must be >= 1")
+        raise SystemExit(
+            "--num-batches must be >= 1"
+        )
 
     if not 0 <= args.batch_index < args.num_batches:
         raise SystemExit(
-            "--batch-index must be between 0 and num-batches-1"
+            "--batch-index must be between "
+            "0 and num-batches-1"
         )
 
     if not args.input_dir.is_dir():
         raise SystemExit(
-            f"Input directory does not exist: {args.input_dir}"
+            f"Input directory does not exist: "
+            f"{args.input_dir}"
         )
 
-    objects = read_choose(args.choose_file)
+    objects = read_choose(
+        args.choose_file
+    )
 
     batch_objects = [
         obj
         for index, obj in enumerate(objects)
-        if index % args.num_batches == args.batch_index
+        if index % args.num_batches
+        == args.batch_index
     ]
 
-    print(f"Total objects: {len(objects)}", flush=True)
     print(
-        f"Batch {args.batch_index + 1}/{args.num_batches}: "
+        f"Total objects: {len(objects)}",
+        flush=True,
+    )
+
+    print(
+        f"Batch {args.batch_index + 1}/"
+        f"{args.num_batches}: "
         f"{len(batch_objects)} objects",
         flush=True,
     )
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     failures = []
     successful_objects = 0
 
-    for number, obj in enumerate(batch_objects, start=1):
+    for number, obj in enumerate(
+        batch_objects,
+        start=1,
+    ):
         print(
-            f"\n=== Batch {args.batch_index + 1}/{args.num_batches} | "
-            f"Object {number}/{len(batch_objects)}: {obj} ===",
+            f"\n=== Batch "
+            f"{args.batch_index + 1}/"
+            f"{args.num_batches} | "
+            f"Object {number}/"
+            f"{len(batch_objects)}: "
+            f"{obj} ===",
             flush=True,
         )
 
-        csv_path = object_csv_path(args.input_dir, obj)
+        csv_path = object_csv_path(
+            args.input_dir,
+            obj,
+        )
 
         if csv_path is None:
             msg = (
-                f"{obj}: {safe_slug(obj)}.csv not found "
-                f"anywhere under {args.input_dir}"
+                f"{obj}: "
+                f"{safe_slug(obj)}.csv "
+                f"not found anywhere under "
+                f"{args.input_dir}"
             )
-            print(f"[MISSING] {msg}", file=sys.stderr, flush=True)
+
+            print(
+                f"[MISSING] {msg}",
+                file=sys.stderr,
+                flush=True,
+            )
+
             failures.append(msg)
             continue
 
-        print(f"[INPUT] {obj} -> {csv_path}", flush=True)
+        print(
+            f"[INPUT] {obj} -> {csv_path}",
+            flush=True,
+        )
 
         object_ok = True
 
@@ -369,29 +591,66 @@ def main() -> int:
 
             except Exception as exc:
                 object_ok = False
-                msg = f"{obj} step={step}m: {exc}"
+
+                msg = (
+                    f"{obj} "
+                    f"step={step}m: {exc}"
+                )
+
                 failures.append(msg)
-                print(f"[FAILED] {msg}", file=sys.stderr, flush=True)
+
+                print(
+                    f"[FAILED] {msg}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         if object_ok:
             successful_objects += 1
 
-    print("\n================ SUMMARY ================", flush=True)
     print(
-        f"Batch: {args.batch_index + 1}/{args.num_batches}",
+        "\n================ SUMMARY ================",
         flush=True,
     )
-    print(f"Objects assigned: {len(batch_objects)}", flush=True)
+
     print(
-        f"Objects fully successful: {successful_objects}",
+        f"Batch: "
+        f"{args.batch_index + 1}/"
+        f"{args.num_batches}",
         flush=True,
     )
-    print(f"Failures: {len(failures)}", flush=True)
+
+    print(
+        f"Objects assigned: "
+        f"{len(batch_objects)}",
+        flush=True,
+    )
+
+    print(
+        f"Objects fully successful: "
+        f"{successful_objects}",
+        flush=True,
+    )
+
+    print(
+        f"Failures: {len(failures)}",
+        flush=True,
+    )
 
     if failures:
-        print("\nFailure list:", file=sys.stderr, flush=True)
+        print(
+            "\nFailure list:",
+            file=sys.stderr,
+            flush=True,
+        )
+
         for item in failures:
-            print(f"  - {item}", file=sys.stderr, flush=True)
+            print(
+                f"  - {item}",
+                file=sys.stderr,
+                flush=True,
+            )
+
         return 1
 
     return 0
