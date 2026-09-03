@@ -1,0 +1,4 @@
+astroquery>=0.4.11
+astropy>=7.0
+numpy>=2.0
+pandas>=2.2
