@@ -1,18 +1,28 @@
-#!/usr/bin/env python3
+from pathlib import Path
+
+code = r'''#!/usr/bin/env python3
 """
 Generate portable HORIZONS_CACHE CSV files for the LIneA asteroid pipeline.
 
 Expected repository layout
 --------------------------
-choose_lsm.txt
+choose_horizons.txt
 parquet/
-    109312.csv
-    2006_GQ59.csv
+    folder1/
+        109312.csv
+    folder2/
+        2006_GQ59.csv
     ...
 HORIZONS_CACHE/
 
-The output filename and columns intentionally match the cache format used by
-Period_search_Multiband_Lomb_Scargle.py / Period_search_High_Order_Fourier.py.
+Current filename convention:
+    object "2006 GQ59" -> 2006_GQ59.csv
+
+The script searches recursively under parquet/, so CSVs may be stored
+inside arbitrary subdirectories.
+
+The output filename and columns match the portable HORIZONS_CACHE format
+used by the LIneA asteroid-analysis pipeline.
 """
 
 from __future__ import annotations
@@ -33,6 +43,14 @@ MJDREF = 2400000.5
 
 
 def safe_slug(value: str) -> str:
+    """
+    Convert an asteroid identifier into the filename-safe form used by the pipeline.
+
+    Examples
+    --------
+    "2006 GQ59" -> "2006_GQ59"
+    "109312"     -> "109312"
+    """
     value = str(value).strip()
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
     value = value.strip("._")
@@ -40,50 +58,91 @@ def safe_slug(value: str) -> str:
 
 
 def read_choose(path: Path) -> list[str]:
+    """Read one asteroid identifier per line, removing blanks/comments/duplicates."""
+    if not path.exists():
+        raise FileNotFoundError(f"Choose file not found: {path}")
+
     objects: list[str] = []
     seen: set[str] = set()
 
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
+
         if not line or line.startswith("#"):
             continue
 
-        # Current convention: one asteroid identifier per line.
-        obj = line
-        if obj not in seen:
-            seen.add(obj)
-            objects.append(obj)
+        if line not in seen:
+            seen.add(line)
+            objects.append(line)
 
     return objects
 
 
-def object_csv_path(input_dir: Path, obj: str) -> Path:
-    # Current batch convention: NO "_ALL".
-    # Example: "2006 GQ59" -> "2006_GQ59.csv"
-    return input_dir / f"{safe_slug(obj)}.csv"
+def object_csv_path(input_dir: Path, obj: str) -> Optional[Path]:
+    """
+    Find the object's CSV recursively anywhere under input_dir.
+
+    Current convention:
+        2006 GQ59 -> 2006_GQ59.csv
+
+    No _ALL suffix is added.
+    """
+    filename = f"{safe_slug(obj)}.csv"
+
+    # Fast path: file directly under parquet/
+    direct = input_dir / filename
+    if direct.exists():
+        return direct
+
+    # Recursive search through every parquet/ subdirectory.
+    matches = sorted(input_dir.rglob(filename))
+
+    if not matches:
+        return None
+
+    if len(matches) > 1:
+        print(
+            f"[WARNING] Multiple CSVs found for {obj}. Using: {matches[0]}",
+            file=sys.stderr,
+            flush=True,
+        )
+        for extra in matches[1:]:
+            print(f"          also found: {extra}", file=sys.stderr, flush=True)
+
+    return matches[0]
 
 
 def read_mjd_range(csv_path: Path) -> tuple[float, float]:
-    df = pd.read_csv(csv_path, usecols=lambda c: c in {
-        "midpointMjdTai", "mjd", "midPointMjdTai"
-    })
+    """
+    Read the observation time range from the Rubin CSV.
+
+    Current expected column:
+        midpointMjdTai
+    """
+    wanted = {"midpointMjdTai", "mjd", "midPointMjdTai"}
+
+    df = pd.read_csv(
+        csv_path,
+        usecols=lambda c: c in wanted,
+    )
 
     if "midpointMjdTai" in df.columns:
         col = "midpointMjdTai"
     elif "mjd" in df.columns:
         col = "mjd"
     elif "midPointMjdTai" in df.columns:
-        # Legacy spelling fallback only.
+        # Legacy capitalization fallback.
         col = "midPointMjdTai"
     else:
         raise ValueError(
-            f"{csv_path} has no supported MJD column. "
-            "Expected 'midpointMjdTai' (current convention)."
+            f"{csv_path} has no supported observation-time column. "
+            "Expected 'midpointMjdTai'."
         )
 
     mjd = pd.to_numeric(df[col], errors="coerce").dropna()
+
     if mjd.empty:
-        raise ValueError(f"No valid MJD values in {csv_path}")
+        raise ValueError(f"No valid MJD values found in {csv_path}")
 
     return float(mjd.min()), float(mjd.max())
 
@@ -92,7 +151,7 @@ def mjd_to_iso_utc(mjd: float) -> str:
     return Time(mjd, format="mjd", scale="utc").isot
 
 
-def cache_path(
+def build_cache_path(
     output_dir: Path,
     target_id: str,
     location: str,
@@ -101,8 +160,12 @@ def cache_path(
     start_mjd: float,
     stop_mjd: float,
 ) -> Path:
+    """
+    Build the portable cache filename used by the LIneA pipeline.
+    """
     return output_dir / (
-        f"{safe_slug(target_id)}__loc_{safe_slug(location)}"
+        f"{safe_slug(target_id)}"
+        f"__loc_{safe_slug(location)}"
         f"__step_{step_minutes}m"
         f"__pad_{pad_minutes}m"
         f"__{start_mjd:.6f}_{stop_mjd:.6f}.csv"
@@ -110,13 +173,24 @@ def cache_path(
 
 
 def cache_is_valid(path: Path) -> bool:
+    """Check whether an existing portable cache CSV looks usable."""
     if not path.exists() or path.stat().st_size == 0:
         return False
+
     try:
         df = pd.read_csv(path, nrows=3)
     except Exception:
         return False
-    required = {"jd", "mjd", "pred_V", "r_au", "delta_au", "alpha_deg"}
+
+    required = {
+        "jd",
+        "mjd",
+        "pred_V",
+        "r_au",
+        "delta_au",
+        "alpha_deg",
+    }
+
     return len(df) >= 2 and required.issubset(df.columns)
 
 
@@ -130,11 +204,15 @@ def query_and_save(
     retries: int,
     sleep_seconds: float,
 ) -> Path:
+    """
+    Query JPL Horizons and save one portable HORIZONS_CACHE CSV.
+    """
     mjd_min, mjd_max = read_mjd_range(csv_path)
+
     start_mjd = mjd_min - pad_minutes / 1440.0
     stop_mjd = mjd_max + pad_minutes / 1440.0
 
-    out_path = cache_path(
+    out_path = build_cache_path(
         output_dir=output_dir,
         target_id=target_id,
         location=location,
@@ -145,7 +223,11 @@ def query_and_save(
     )
 
     if cache_is_valid(out_path):
-        print(f"[SKIP cached] {target_id} step={step_minutes}m -> {out_path.name}", flush=True)
+        print(
+            f"[SKIP cached] {target_id} "
+            f"step={step_minutes}m -> {out_path.name}",
+            flush=True,
+        )
         return out_path
 
     epochs = {
@@ -159,8 +241,9 @@ def query_and_save(
     for attempt in range(1, retries + 1):
         try:
             print(
-                f"[QUERY] {target_id} | {csv_path.name} | "
-                f"step={step_minutes}m | attempt={attempt}/{retries}",
+                f"[QUERY] {target_id} | {csv_path} | "
+                f"step={step_minutes}m | "
+                f"attempt={attempt}/{retries}",
                 flush=True,
             )
 
@@ -169,18 +252,42 @@ def query_and_save(
                 location=location,
                 epochs=epochs,
             )
+
             eph = obj.ephemerides()
             eph_df = eph.to_pandas()
 
-            out = pd.DataFrame({
-                "jd": pd.to_numeric(eph_df.get("datetime_jd", np.nan), errors="coerce"),
-                "pred_V": pd.to_numeric(eph_df.get("V", np.nan), errors="coerce"),
-                "r_au": pd.to_numeric(eph_df.get("r", np.nan), errors="coerce"),
-                "delta_au": pd.to_numeric(eph_df.get("delta", np.nan), errors="coerce"),
-                "alpha_deg": pd.to_numeric(eph_df.get("alpha", np.nan), errors="coerce"),
-                "RA_deg": pd.to_numeric(eph_df.get("RA", np.nan), errors="coerce"),
-                "DEC_deg": pd.to_numeric(eph_df.get("DEC", np.nan), errors="coerce"),
-            })
+            out = pd.DataFrame(
+                {
+                    "jd": pd.to_numeric(
+                        eph_df.get("datetime_jd", np.nan),
+                        errors="coerce",
+                    ),
+                    "pred_V": pd.to_numeric(
+                        eph_df.get("V", np.nan),
+                        errors="coerce",
+                    ),
+                    "r_au": pd.to_numeric(
+                        eph_df.get("r", np.nan),
+                        errors="coerce",
+                    ),
+                    "delta_au": pd.to_numeric(
+                        eph_df.get("delta", np.nan),
+                        errors="coerce",
+                    ),
+                    "alpha_deg": pd.to_numeric(
+                        eph_df.get("alpha", np.nan),
+                        errors="coerce",
+                    ),
+                    "RA_deg": pd.to_numeric(
+                        eph_df.get("RA", np.nan),
+                        errors="coerce",
+                    ),
+                    "DEC_deg": pd.to_numeric(
+                        eph_df.get("DEC", np.nan),
+                        errors="coerce",
+                    ),
+                }
+            )
 
             out = out.dropna(subset=["jd"]).copy()
             out["mjd"] = out["jd"] - MJDREF
@@ -188,17 +295,22 @@ def query_and_save(
 
             if len(out) < 2:
                 raise RuntimeError(
-                    f"Horizons returned only {len(out)} usable rows for {target_id}"
+                    f"Horizons returned only {len(out)} usable rows "
+                    f"for {target_id}"
                 )
 
             output_dir.mkdir(parents=True, exist_ok=True)
-            tmp = out_path.with_suffix(".tmp.csv")
-            out.to_csv(tmp, index=False)
-            tmp.replace(out_path)
+
+            # Write atomically so a failed job does not leave a half-written CSV.
+            tmp_path = out_path.with_suffix(".tmp.csv")
+            out.to_csv(tmp_path, index=False)
+            tmp_path.replace(out_path)
 
             print(
-                f"[OK] {target_id} step={step_minutes}m "
-                f"rows={len(out)} -> {out_path.name}",
+                f"[OK] {target_id} "
+                f"step={step_minutes}m "
+                f"rows={len(out)} "
+                f"-> {out_path.name}",
                 flush=True,
             )
 
@@ -209,82 +321,173 @@ def query_and_save(
 
         except Exception as exc:
             last_exc = exc
+
             print(
-                f"[ERROR] {target_id} step={step_minutes}m "
+                f"[ERROR] {target_id} "
+                f"step={step_minutes}m "
                 f"attempt={attempt}: {exc}",
                 file=sys.stderr,
                 flush=True,
             )
+
             if attempt < retries:
-                wait = sleep_seconds * (2 ** (attempt - 1))
-                wait = max(wait, 2.0)
-                print(f"  retrying in {wait:.1f}s", flush=True)
+                wait = max(
+                    sleep_seconds * (2 ** (attempt - 1)),
+                    2.0,
+                )
+
+                print(
+                    f"  retrying in {wait:.1f}s",
+                    flush=True,
+                )
+
                 time.sleep(wait)
 
     raise RuntimeError(
-        f"Failed Horizons query for {target_id}, step={step_minutes}m "
-        f"after {retries} attempts: {last_exc}"
+        f"Failed Horizons query for {target_id}, "
+        f"step={step_minutes}m after {retries} attempts: "
+        f"{last_exc}"
     )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--choose-file", type=Path, default=Path("choose_lsm.txt"))
-    parser.add_argument("--input-dir", type=Path, default=Path("parquet"))
-    parser.add_argument("--output-dir", type=Path, default=Path("HORIZONS_CACHE"))
-    parser.add_argument("--location", default="X05")
-    parser.add_argument("--step-minutes", type=int, nargs="+", default=[1, 10])
-    parser.add_argument("--pad-minutes", type=int, default=10)
-    parser.add_argument("--batch-index", type=int, required=True)
-    parser.add_argument("--num-batches", type=int, required=True)
-    parser.add_argument("--retries", type=int, default=4)
+
+    parser.add_argument(
+        "--choose-file",
+        type=Path,
+        default=Path("choose_horizons.txt"),
+    )
+
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        default=Path("parquet"),
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("HORIZONS_CACHE"),
+    )
+
+    parser.add_argument(
+        "--location",
+        default="X05",
+    )
+
+    parser.add_argument(
+        "--step-minutes",
+        type=int,
+        nargs="+",
+        default=[1, 10],
+    )
+
+    parser.add_argument(
+        "--pad-minutes",
+        type=int,
+        default=10,
+    )
+
+    parser.add_argument(
+        "--batch-index",
+        type=int,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--num-batches",
+        type=int,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=4,
+    )
+
     parser.add_argument(
         "--sleep-seconds",
         type=float,
         default=1.5,
-        help="Pause after successful queries; retries use increasing waits.",
+        help=(
+            "Pause after successful requests. "
+            "Retries use progressively longer waits."
+        ),
     )
+
     args = parser.parse_args()
 
     if args.num_batches < 1:
         raise SystemExit("--num-batches must be >= 1")
+
     if not 0 <= args.batch_index < args.num_batches:
-        raise SystemExit("--batch-index must be in [0, num-batches)")
+        raise SystemExit(
+            "--batch-index must be between 0 and num-batches-1"
+        )
+
+    if not args.input_dir.exists():
+        raise SystemExit(
+            f"Input directory does not exist: {args.input_dir}"
+        )
 
     objects = read_choose(args.choose_file)
 
-    # Stable round-robin partitioning.
+    # Stable round-robin distribution across GitHub matrix jobs.
     batch_objects = [
-        obj for i, obj in enumerate(objects)
+        obj
+        for i, obj in enumerate(objects)
         if i % args.num_batches == args.batch_index
     ]
 
     print(
-        f"Total objects: {len(objects)} | "
-        f"batch {args.batch_index + 1}/{args.num_batches}: {len(batch_objects)}",
+        f"Total objects: {len(objects)}",
+        flush=True,
+    )
+
+    print(
+        f"Batch {args.batch_index + 1}/{args.num_batches}: "
+        f"{len(batch_objects)} objects",
         flush=True,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     failures: list[str] = []
-    successes = 0
+    successful_objects = 0
 
-    for n, obj in enumerate(batch_objects, start=1):
+    for number, obj in enumerate(batch_objects, start=1):
         print(
-            f"\n=== batch {args.batch_index + 1}/{args.num_batches} "
-            f"object {n}/{len(batch_objects)}: {obj} ===",
+            f"\n=== Batch {args.batch_index + 1}/{args.num_batches} | "
+            f"Object {number}/{len(batch_objects)}: {obj} ===",
             flush=True,
         )
 
         csv_path = object_csv_path(args.input_dir, obj)
-        if not csv_path.exists():
-            msg = f"{obj}: missing input CSV {csv_path}"
-            print(f"[MISSING] {msg}", file=sys.stderr, flush=True)
+
+        if csv_path is None:
+            msg = (
+                f"{obj}: {safe_slug(obj)}.csv not found "
+                f"anywhere under {args.input_dir}"
+            )
+
+            print(
+                f"[MISSING] {msg}",
+                file=sys.stderr,
+                flush=True,
+            )
+
             failures.append(msg)
             continue
 
+        print(
+            f"[INPUT] {obj} -> {csv_path}",
+            flush=True,
+        )
+
         object_ok = True
+
         for step in args.step_minutes:
             try:
                 query_and_save(
@@ -297,24 +500,64 @@ def main() -> int:
                     retries=args.retries,
                     sleep_seconds=args.sleep_seconds,
                 )
+
             except Exception as exc:
                 object_ok = False
-                failures.append(f"{obj} step={step}m: {exc}")
-                print(f"[FAILED] {obj} step={step}m: {exc}", file=sys.stderr, flush=True)
+
+                msg = (
+                    f"{obj} step={step}m: {exc}"
+                )
+
+                failures.append(msg)
+
+                print(
+                    f"[FAILED] {msg}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         if object_ok:
-            successes += 1
+            successful_objects += 1
 
-    print("\n================ SUMMARY ================", flush=True)
-    print(f"Batch: {args.batch_index + 1}/{args.num_batches}", flush=True)
-    print(f"Objects assigned: {len(batch_objects)}", flush=True)
-    print(f"Objects fully successful: {successes}", flush=True)
-    print(f"Failures: {len(failures)}", flush=True)
+    print(
+        "\n================ SUMMARY ================",
+        flush=True,
+    )
+
+    print(
+        f"Batch: {args.batch_index + 1}/{args.num_batches}",
+        flush=True,
+    )
+
+    print(
+        f"Objects assigned: {len(batch_objects)}",
+        flush=True,
+    )
+
+    print(
+        f"Objects fully successful: {successful_objects}",
+        flush=True,
+    )
+
+    print(
+        f"Failures: {len(failures)}",
+        flush=True,
+    )
 
     if failures:
-        print("\nFailure list:", file=sys.stderr, flush=True)
+        print(
+            "\nFailure list:",
+            file=sys.stderr,
+            flush=True,
+        )
+
         for item in failures:
-            print(f"  - {item}", file=sys.stderr, flush=True)
+            print(
+                f"  - {item}",
+                file=sys.stderr,
+                flush=True,
+            )
+
         return 1
 
     return 0
@@ -322,3 +565,9 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+'''
+
+path = Path("/mnt/data/prefetch_horizons_github.py")
+path.write_text(code, encoding="utf-8")
+compile(code, str(path), "exec")
+print(path)
