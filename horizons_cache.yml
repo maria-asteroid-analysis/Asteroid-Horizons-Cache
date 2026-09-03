@@ -33,8 +33,8 @@ jobs:
 
       - name: Generate Horizons cache
         run: |
-          python -u scripts/prefetch_horizons_github.py \
-            --choose-file choose_lsm.txt \
+          python -u prefetch_horizons_github.py \
+            --choose-file choose_horizons.txt \
             --input-dir parquet \
             --output-dir HORIZONS_CACHE \
             --location X05 \
